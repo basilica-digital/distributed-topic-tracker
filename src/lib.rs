@@ -13,15 +13,15 @@ pub use gossip::{
 
 pub use crypto::{
     DefaultSecretRotation, EncryptedRecord, Record, RecordPublisher, RecordTopic, RotationHandle,
-    SecretRotation, encryption_keypair, salt, signing_keypair,
+    SecretRotation, encryption_keypair, node_slot, salt, signing_keypair,
 };
 pub use dht::Dht;
 
-/// Maximum number of bootstrap records allowed per topic per time slot (minute).
+/// Number of independent DHT slots per (topic, minute) combination.
 ///
-/// When publishing to the DHT, records are not published if this threshold
-/// has already been reached for the current minute slot.
-pub const MAX_BOOTSTRAP_RECORDS: usize = 100;
+/// Nodes are distributed across slots based on a hash of their node ID,
+/// reducing write collisions from N-to-1 to ~N/DHT_SLOTS-to-1.
+pub const DHT_SLOTS: usize = 8;
 
 /// Get the current Unix minute timestamp, optionally offset.
 ///

@@ -185,45 +185,31 @@ impl RecordPublisher {
 }
 
 impl RecordPublisher {
-    /// Publish a record to the DHT if slot capacity allows.
+    /// Publish a record to the DHT in this node's assigned slot.
     ///
-    /// Checks existing record count for this time slot and skips publishing if
-    /// `MAX_BOOTSTRAP_RECORDS` limit reached.
+    /// The slot is derived deterministically from the node's public key,
+    /// topic, and time, distributing nodes across `DHT_SLOTS` independent
+    /// DHT entries to avoid write collisions.
     pub async fn publish_record(&self, record: Record) -> Result<()> {
-        let records = self
-            .get_records(record.unix_minute())
-            .await
-            .iter()
-            .cloned()
-            .collect::<HashSet<_>>();
-
-        tracing::debug!(
-            "RecordPublisher: found {} existing records for unix_minute {}",
-            records.len(),
-            record.unix_minute()
+        let slot = crate::crypto::keys::node_slot(
+            &self.pub_key.to_bytes(),
+            self.record_topic,
+            record.unix_minute(),
         );
-
-        if records.len() >= crate::MAX_BOOTSTRAP_RECORDS {
-            tracing::debug!(
-                "RecordPublisher: max records reached ({}), skipping publish",
-                crate::MAX_BOOTSTRAP_RECORDS
-            );
-            return Ok(());
-        }
-
-        // Publish own records
-        let sign_key = crate::crypto::keys::signing_keypair(self.record_topic, record.unix_minute);
-        let salt = crate::crypto::keys::salt(self.record_topic, record.unix_minute);
+        let sign_key =
+            crate::crypto::keys::signing_keypair(self.record_topic, record.unix_minute(), slot);
+        let salt = crate::crypto::keys::salt(self.record_topic, record.unix_minute(), slot);
         let encryption_key = crate::crypto::keys::encryption_keypair(
             self.record_topic,
             &self.secret_rotation.clone().unwrap_or_default(),
             self.initial_secret_hash,
-            record.unix_minute,
+            record.unix_minute(),
         );
         let encrypted_record = record.encrypt(&encryption_key);
 
         tracing::debug!(
-            "RecordPublisher: publishing record to DHT for unix_minute {}",
+            "RecordPublisher: publishing record to DHT slot {} for unix_minute {}",
+            slot,
             record.unix_minute()
         );
 
@@ -238,69 +224,85 @@ impl RecordPublisher {
             )
             .await?;
 
-        tracing::debug!("RecordPublisher: successfully published to DHT");
+        tracing::debug!(
+            "RecordPublisher: successfully published to DHT slot {}",
+            slot
+        );
         Ok(())
     }
 
     /// Retrieve all verified records for a given time slot from the DHT.
     ///
+    /// Queries all `DHT_SLOTS` concurrently and merges results.
     /// Filters out records from this publisher's own node ID.
     pub async fn get_records(&self, unix_minute: u64) -> HashSet<Record> {
         tracing::debug!(
-            "RecordPublisher: fetching records from DHT for unix_minute {}",
-            unix_minute
+            "RecordPublisher: fetching records from DHT for unix_minute {} ({} slots)",
+            unix_minute,
+            crate::DHT_SLOTS
         );
 
-        let topic_sign = crate::crypto::keys::signing_keypair(self.record_topic, unix_minute);
         let encryption_key = crate::crypto::keys::encryption_keypair(
             self.record_topic,
             &self.secret_rotation.clone().unwrap_or_default(),
             self.initial_secret_hash,
             unix_minute,
         );
-        let salt = crate::crypto::keys::salt(self.record_topic, unix_minute);
 
-        // Get records, decrypt and verify
-        let records_iter = self
-            .dht
-            .get(
-                topic_sign.verifying_key(),
-                Some(salt.to_vec()),
-                None,
-                Duration::from_secs(10),
-            )
-            .await
-            .unwrap_or_default();
+        // Query all slots concurrently
+        let mut join_set = tokio::task::JoinSet::new();
+        for slot in 0..crate::DHT_SLOTS {
+            let dht = self.dht.clone();
+            let topic_sign =
+                crate::crypto::keys::signing_keypair(self.record_topic, unix_minute, slot);
+            let slot_salt = crate::crypto::keys::salt(self.record_topic, unix_minute, slot);
+
+            join_set.spawn(async move {
+                dht.get(
+                    topic_sign.verifying_key(),
+                    Some(slot_salt.to_vec()),
+                    None,
+                    Duration::from_secs(5),
+                )
+                .await
+                .unwrap_or_default()
+            });
+        }
+
+        let topic_hash = self.record_topic.hash();
+        let self_pub_key = self.pub_key;
+
+        // Collect and verify all results
+        let mut verified_records = HashSet::new();
+        let mut raw_count = 0usize;
+        while let Some(result) = join_set.join_next().await {
+            let items = match result {
+                Ok(items) => items,
+                Err(_) => continue,
+            };
+            raw_count += items.len();
+
+            for item in &items {
+                let record = (|| -> Result<Record> {
+                    let encrypted = EncryptedRecord::from_bytes(item.value().to_vec())?;
+                    let decrypted = encrypted.decrypt(&encryption_key)?;
+                    decrypted.verify(&topic_hash, unix_minute)?;
+                    Ok(decrypted)
+                })();
+
+                if let Ok(record) = record {
+                    if record.node_id() == self_pub_key.to_bytes() {
+                        tracing::debug!("RecordPublisher: filtered out self");
+                        continue;
+                    }
+                    verified_records.insert(record);
+                }
+            }
+        }
 
         tracing::debug!(
-            "RecordPublisher: received {} raw records from DHT",
-            records_iter.len()
-        );
-
-        let verified_records = records_iter
-            .iter()
-            .filter_map(
-                |record| match EncryptedRecord::from_bytes(record.value().to_vec()) {
-                    Ok(encrypted_record) => match encrypted_record.decrypt(&encryption_key) {
-                        Ok(record) => match record.verify(&self.record_topic.hash(), unix_minute) {
-                            Ok(_) => match record.node_id().eq(self.pub_key.as_bytes()) {
-                                true => {
-                                    tracing::debug!("RecordPublisher: filtered out self");
-                                    None
-                                }
-                                false => Some(record),
-                            },
-                            Err(_) => None,
-                        },
-                        Err(_) => None,
-                    },
-                    Err(_) => None,
-                },
-            )
-            .collect::<HashSet<_>>();
-
-        tracing::debug!(
-            "RecordPublisher: verified {} records (filtered self)",
+            "RecordPublisher: received {} raw, verified {} records (filtered self)",
+            raw_count,
             verified_records.len()
         );
         verified_records

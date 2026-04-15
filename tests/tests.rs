@@ -2,7 +2,7 @@ use std::str::FromStr;
 
 use distributed_topic_tracker::{
     DefaultSecretRotation, EncryptedRecord, GossipRecordContent, Record, RecordTopic,
-    RotationHandle, encryption_keypair, salt, signing_keypair, unix_minute,
+    RotationHandle, encryption_keypair, node_slot, salt, signing_keypair, unix_minute,
 };
 use mainline::SigningKey;
 
@@ -197,16 +197,21 @@ fn test_topic_signing_keypair_deterministic() {
     let topic_id = RecordTopic::from_str("test-topic").unwrap();
     let record_topic = topic_id;
     let unix_minute = 12345u64;
+    let slot = 0;
 
-    let key1 = signing_keypair(record_topic, unix_minute);
-    let key2 = signing_keypair(record_topic, unix_minute);
+    let key1 = signing_keypair(record_topic, unix_minute, slot);
+    let key2 = signing_keypair(record_topic, unix_minute, slot);
 
     // Same inputs should produce same keypair
     assert_eq!(key1.to_bytes(), key2.to_bytes());
 
     // Different unix_minute should produce different keypair
-    let key3 = signing_keypair(record_topic, unix_minute + 1);
+    let key3 = signing_keypair(record_topic, unix_minute + 1, slot);
     assert_ne!(key1.to_bytes(), key3.to_bytes());
+
+    // Different slot should produce different keypair
+    let key4 = signing_keypair(record_topic, unix_minute, 1);
+    assert_ne!(key1.to_bytes(), key4.to_bytes());
 }
 
 #[test]
@@ -238,14 +243,41 @@ fn test_topic_salt_deterministic() {
     let topic_id = RecordTopic::from_str("test-topic").unwrap();
     let record_topic = topic_id;
     let unix_minute = 12345u64;
+    let slot = 0;
 
-    let salt1 = salt(record_topic, unix_minute);
-    let salt2 = salt(record_topic, unix_minute);
+    let salt1 = salt(record_topic, unix_minute, slot);
+    let salt2 = salt(record_topic, unix_minute, slot);
 
     // Same inputs should produce same salt
     assert_eq!(salt1, salt2);
 
     // Different unix_minute should produce different salt
-    let salt3 = salt(record_topic, unix_minute + 1);
+    let salt3 = salt(record_topic, unix_minute + 1, slot);
     assert_ne!(salt1, salt3);
+
+    // Different slot should produce different salt
+    let salt4 = salt(record_topic, unix_minute, 1);
+    assert_ne!(salt1, salt4);
+}
+
+#[test]
+fn test_node_slot_deterministic() {
+    let topic = RecordTopic::from_str("test-topic").unwrap();
+    let node_id = [42u8; 32];
+    let unix_minute = 12345u64;
+
+    let slot1 = node_slot(&node_id, topic, unix_minute);
+    let slot2 = node_slot(&node_id, topic, unix_minute);
+
+    // Same inputs produce same slot
+    assert_eq!(slot1, slot2);
+
+    // Slot is within bounds
+    assert!(slot1 < distributed_topic_tracker::DHT_SLOTS);
+
+    // Different node_id may produce different slot
+    let other_node = [99u8; 32];
+    let slot3 = node_slot(&other_node, topic, unix_minute);
+    // Not asserting inequality (could collide), but must be in bounds
+    assert!(slot3 < distributed_topic_tracker::DHT_SLOTS);
 }

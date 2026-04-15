@@ -1,46 +1,50 @@
 //! Mainline BitTorrent DHT client for mutable record operations.
 //!
 //! Provides async interface for DHT get/put operations with automatic
-//! retry logic and connection management.
+//! retry logic and lazy connection initialization.
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use actor_helper::{Action, Actor, Handle, Receiver, act};
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use ed25519_dalek::VerifyingKey;
 use futures_lite::StreamExt;
-use mainline::{MutableItem, SigningKey};
+use mainline::MutableItem;
 
 const RETRY_DEFAULT: usize = 3;
 
-/// DHT client wrapper with actor-based concurrency.
+/// DHT client wrapper with lazy initialization and concurrent access.
 ///
-/// Manages connections to the mainline DHT and handles
-/// mutable record get/put operations with automatic retries.
+/// Manages a shared connection to the mainline DHT. The underlying
+/// `AsyncDht` is `Clone` and all methods take `&self`, so multiple
+/// concurrent queries are supported.
 #[derive(Debug, Clone)]
 pub struct Dht {
-    api: Handle<DhtActor, anyhow::Error>,
-}
-
-#[derive(Debug)]
-struct DhtActor {
-    rx: Receiver<Action<Self>>,
-    dht: Option<mainline::async_dht::AsyncDht>,
+    inner: Arc<tokio::sync::OnceCell<mainline::async_dht::AsyncDht>>,
 }
 
 impl Dht {
     /// Create a new DHT client.
     ///
-    /// Spawns a background actor for handling DHT operations.
+    /// The actual mainline DHT connection is established lazily on first use.
     pub fn new() -> Self {
-        let (api, rx) = Handle::channel();
+        Self {
+            inner: Arc::new(tokio::sync::OnceCell::new()),
+        }
+    }
 
-        tokio::spawn(async move {
-            let mut actor = DhtActor { rx, dht: None };
-            let _ = actor.run().await;
-        });
-
-        Self { api }
+    /// Get or initialize the underlying AsyncDht client.
+    async fn client(&self) -> Result<mainline::async_dht::AsyncDht> {
+        let dht = self
+            .inner
+            .get_or_try_init(|| async {
+                mainline::Dht::builder()
+                    .build()
+                    .map(|d| d.as_async())
+                    .map_err(|e| anyhow::anyhow!(e))
+            })
+            .await?;
+        Ok(dht.clone())
     }
 
     /// Retrieve mutable records from the DHT.
@@ -58,9 +62,13 @@ impl Dht {
         more_recent_than: Option<i64>,
         timeout: Duration,
     ) -> Result<Vec<MutableItem>> {
-        self.api
-            .call(act!(actor => actor.get(pub_key, salt, more_recent_than, timeout)))
-            .await
+        let dht = self.client().await?;
+        Ok(tokio::time::timeout(
+            timeout,
+            dht.get_mutable(pub_key.as_bytes(), salt.as_deref(), more_recent_than)
+                .collect::<Vec<_>>(),
+        )
+        .await?)
     }
 
     /// Publish a mutable record to the DHT.
@@ -75,72 +83,17 @@ impl Dht {
     /// * `timeout` - Per-request timeout
     pub async fn put_mutable(
         &self,
-        signing_key: SigningKey,
+        signing_key: mainline::SigningKey,
         pub_key: VerifyingKey,
         salt: Option<Vec<u8>>,
         data: Vec<u8>,
         retry_count: Option<usize>,
         timeout: Duration,
     ) -> Result<()> {
-        self.api.call(act!(actor => actor.put_mutable(signing_key, pub_key, salt, data, retry_count, timeout))).await
-    }
-}
+        let retries = retry_count.unwrap_or(RETRY_DEFAULT);
 
-impl Default for Dht {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Actor<anyhow::Error> for DhtActor {
-    async fn run(&mut self) -> Result<()> {
-        loop {
-            tokio::select! {
-                Ok(action) = self.rx.recv_async() => {
-                    action(self).await;
-                }
-                else => break Ok(()),
-            }
-        }
-    }
-}
-
-impl DhtActor {
-    pub async fn get(
-        &mut self,
-        pub_key: VerifyingKey,
-        salt: Option<Vec<u8>>,
-        more_recent_than: Option<i64>,
-        timeout: Duration,
-    ) -> Result<Vec<MutableItem>> {
-        if self.dht.is_none() {
-            self.reset().await?;
-        }
-
-        let dht = self.dht.as_mut().context("DHT not initialized")?;
-        Ok(tokio::time::timeout(
-            timeout,
-            dht.get_mutable(pub_key.as_bytes(), salt.as_deref(), more_recent_than)
-                .collect::<Vec<_>>(),
-        )
-        .await?)
-    }
-
-    pub async fn put_mutable(
-        &mut self,
-        signing_key: SigningKey,
-        pub_key: VerifyingKey,
-        salt: Option<Vec<u8>>,
-        data: Vec<u8>,
-        retry_count: Option<usize>,
-        timeout: Duration,
-    ) -> Result<()> {
-        if self.dht.is_none() {
-            self.reset().await?;
-        }
-
-        for i in 0..retry_count.unwrap_or(RETRY_DEFAULT) {
-            let dht = self.dht.as_mut().context("DHT not initialized")?;
+        for i in 0..retries {
+            let dht = self.client().await?;
 
             let most_recent_result = tokio::time::timeout(
                 timeout,
@@ -171,19 +124,18 @@ impl DhtActor {
 
             if put_result.is_some() {
                 break;
-            } else if i == retry_count.unwrap_or(RETRY_DEFAULT) - 1 {
+            } else if i == retries - 1 {
                 bail!("failed to publish record")
             }
-
-            self.reset().await?;
 
             tokio::time::sleep(Duration::from_millis(rand::random::<u64>() % 2000)).await;
         }
         Ok(())
     }
+}
 
-    async fn reset(&mut self) -> Result<()> {
-        self.dht = Some(mainline::Dht::builder().build()?.as_async());
-        Ok(())
+impl Default for Dht {
+    fn default() -> Self {
+        Self::new()
     }
 }

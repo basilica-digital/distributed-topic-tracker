@@ -73,32 +73,34 @@ impl PublisherActor {
     async fn publish(&mut self) -> Result<()> {
         let unix_minute = crate::unix_minute(0);
 
-        let active_peers = self
+        let mut active_peers: Vec<[u8; 32]> = self
             .gossip_receiver
             .neighbors()
             .await
             .iter()
             .filter_map(|pub_key| TryInto::<[u8; 32]>::try_into(pub_key.as_slice()).ok())
-            .collect::<Vec<_>>();
+            .collect();
+        active_peers.truncate(5);
+        active_peers.resize(5, [0u8; 32]);
 
-        let last_message_hashes = self
-            .gossip_receiver
-            .last_message_hashes()
-            .await
-            .iter()
-            .filter_map(|hash| TryInto::<[u8; 32]>::try_into(hash.as_slice()).ok())
-            .collect::<Vec<_>>();
+        let mut last_message_hashes: Vec<[u8; 32]> =
+            self.gossip_receiver.last_message_hashes().await;
+        last_message_hashes.truncate(5);
+        last_message_hashes.resize(5, [0u8; 32]);
 
         tracing::debug!(
             "Publisher: publishing record for unix_minute {} with {} active_peers and {} message_hashes",
             unix_minute,
-            active_peers.len(),
-            last_message_hashes.len()
+            active_peers.iter().filter(|p| **p != [0u8; 32]).count(),
+            last_message_hashes
+                .iter()
+                .filter(|h| **h != [0u8; 32])
+                .count()
         );
 
         let record_content = crate::gossip::GossipRecordContent {
-            active_peers: active_peers.as_slice().try_into()?,
-            last_message_hashes: last_message_hashes.as_slice().try_into()?,
+            active_peers: active_peers.try_into().expect("padded to exactly 5"),
+            last_message_hashes: last_message_hashes.try_into().expect("padded to exactly 5"),
         };
 
         tracing::debug!("Publisher: created record content: {:?}", record_content);

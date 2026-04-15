@@ -7,7 +7,7 @@ mod keys;
 mod record;
 
 pub use keys::{
-    DefaultSecretRotation, RotationHandle, SecretRotation, encryption_keypair, salt,
+    DefaultSecretRotation, RotationHandle, SecretRotation, encryption_keypair, node_slot, salt,
     signing_keypair,
 };
 pub use record::{EncryptedRecord, Record, RecordPublisher, RecordTopic};

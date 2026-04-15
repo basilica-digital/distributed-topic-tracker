@@ -87,23 +87,27 @@ impl RotationHandle {
 
 /// Derive Ed25519 signing key for DHT record authentication.
 ///
-/// Keys are deterministic per topic and time slot, derived from topic hash.
-/// All nodes use the same derived keypair for a given topic+time combination,
-/// and its verifying key serves as the DHT routing key for storing/retrieving
-/// bootstrap records. The actual record content is signed separately by each
-/// node's individual keypair (not this one).
+/// Keys are deterministic per topic, time slot, and DHT slot index.
+/// Nodes sharing the same slot derive the same keypair, whose verifying key
+/// serves as the DHT routing key for that slot. The actual record content
+/// is signed separately by each node's individual keypair (not this one).
 ///
 /// # Example
 ///
 /// ```ignore
 /// let topic = RecordTopic::from_str("my-topic")?;
 /// let unix_minute = crate::unix_minute(0);
-/// let signing_key = signing_keypair(topic, unix_minute);
+/// let signing_key = signing_keypair(topic, unix_minute, 0);
 /// ```
-pub fn signing_keypair(record_topic: RecordTopic, unix_minute: u64) -> ed25519_dalek::SigningKey {
+pub fn signing_keypair(
+    record_topic: RecordTopic,
+    unix_minute: u64,
+    slot: usize,
+) -> ed25519_dalek::SigningKey {
     let mut sign_keypair_hash = sha2::Sha512::new();
     sign_keypair_hash.update(record_topic.hash());
     sign_keypair_hash.update(unix_minute.to_le_bytes());
+    sign_keypair_hash.update((slot as u64).to_le_bytes());
     let sign_keypair_seed: [u8; 32] = sign_keypair_hash.finalize()[..32]
         .try_into()
         .expect("hashing failed");
@@ -136,13 +140,27 @@ pub fn encryption_keypair(
 
 /// Derive DHT salt for mutable record lookups.
 ///
-/// Salt = SHA512(topic_hash || unix_minute.to_le_bytes())[..32]
-/// Ensures records are stored in different DHT slots per minute.
-pub fn salt(record_topic: RecordTopic, unix_minute: u64) -> [u8; 32] {
+/// Salt = SHA512(topic_hash || unix_minute [|| slot])[..32]
+/// Ensures records are stored in different DHT locations per minute and slot.
+///
+pub fn salt(record_topic: RecordTopic, unix_minute: u64, slot: usize) -> [u8; 32] {
     let mut slot_hash = sha2::Sha512::new();
     slot_hash.update(record_topic.hash());
     slot_hash.update(unix_minute.to_le_bytes());
+    slot_hash.update((slot as u64).to_le_bytes());
     slot_hash.finalize()[..32]
         .try_into()
         .expect("hashing failed")
+}
+
+/// Deterministically map a node to a DHT slot for a given topic and minute.
+///
+/// Uses SHA512(node_id || topic_hash || unix_minute) to distribute nodes
+/// uniformly across `DHT_SLOTS` slots.
+pub fn node_slot(node_id: &[u8; 32], record_topic: RecordTopic, unix_minute: u64) -> usize {
+    let mut h = sha2::Sha512::new();
+    h.update(node_id);
+    h.update(record_topic.hash());
+    h.update(unix_minute.to_le_bytes());
+    (h.finalize()[0] as usize) % crate::DHT_SLOTS
 }

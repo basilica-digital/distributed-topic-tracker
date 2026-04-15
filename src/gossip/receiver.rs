@@ -129,6 +129,9 @@ impl Actor<anyhow::Error> for GossipReceiverActor {
                                 let mut hash = sha2::Sha512::new();
                                 hash.update(msg.content.clone());
                                 if let Ok(lmh) = hash.finalize()[..32].try_into() {
+                                    if self.last_message_hashes.len() >= 5 {
+                                        self.last_message_hashes.remove(0);
+                                    }
                                     self.last_message_hashes.push(lmh);
                                 }
                             }

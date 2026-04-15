@@ -1,7 +1,5 @@
 use anyhow::Result;
-use iroh::{
-    Endpoint, SecretKey,
-};
+use iroh::{Endpoint, SecretKey};
 use iroh_gossip::net::Gossip;
 
 // Imports from distrubuted-topic-tracker
