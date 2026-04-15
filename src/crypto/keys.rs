@@ -92,6 +92,9 @@ impl RotationHandle {
 /// serves as the DHT routing key for that slot. The actual record content
 /// is signed separately by each node's individual keypair (not this one).
 ///
+/// Slot 0 omits the slot index from the hash to stay compatible with
+/// older versions that had no slot concept.
+///
 /// # Example
 ///
 /// ```ignore
@@ -107,7 +110,9 @@ pub fn signing_keypair(
     let mut sign_keypair_hash = sha2::Sha512::new();
     sign_keypair_hash.update(record_topic.hash());
     sign_keypair_hash.update(unix_minute.to_le_bytes());
-    sign_keypair_hash.update((slot as u64).to_le_bytes());
+    if slot > 0 {
+        sign_keypair_hash.update((slot as u64).to_le_bytes());
+    }
     let sign_keypair_seed: [u8; 32] = sign_keypair_hash.finalize()[..32]
         .try_into()
         .expect("hashing failed");
@@ -143,11 +148,15 @@ pub fn encryption_keypair(
 /// Salt = SHA512(topic_hash || unix_minute [|| slot])[..32]
 /// Ensures records are stored in different DHT locations per minute and slot.
 ///
+/// Slot 0 omits the slot index from the hash to stay compatible with
+/// older versions that had no slot concept.
 pub fn salt(record_topic: RecordTopic, unix_minute: u64, slot: usize) -> [u8; 32] {
     let mut slot_hash = sha2::Sha512::new();
     slot_hash.update(record_topic.hash());
     slot_hash.update(unix_minute.to_le_bytes());
-    slot_hash.update((slot as u64).to_le_bytes());
+    if slot > 0 {
+        slot_hash.update((slot as u64).to_le_bytes());
+    }
     slot_hash.finalize()[..32]
         .try_into()
         .expect("hashing failed")
